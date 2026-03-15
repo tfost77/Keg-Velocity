@@ -1,0 +1,23 @@
+# Environment variables & secrets
+.env
+.env.*
+
+# Google OAuth credentials
+credentials.json
+token.json
+
+# Temporary processing files
+.tmp/
+
+# CSV data files (raw data, regenerable)
+*.csv
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# macOS
+.DS_Store
