@@ -40,8 +40,19 @@ SCOPES = [
 
 load_dotenv(BASE_DIR / ".env")
 
+
+def load_config():
+    config_path = BASE_DIR / "config.json"
+    if not config_path.exists():
+        print("ERROR: config.json not found. Copy config.example.json to config.json and customize it.")
+        sys.exit(1)
+    with open(config_path) as f:
+        return json.load(f)
+
+CONFIG = load_config()
+
 # Section header in the Cans Inventory tab
-CANS_SECTION_HEADER = "Combined Locust Point & Timonium Can Inventory"
+CANS_SECTION_HEADER = CONFIG["cans_section_header"]
 
 # Weights for can types
 CAN_WEIGHTS = {
@@ -50,15 +61,13 @@ CAN_WEIGHTS = {
 }
 
 # Maps stripped can name → sheet column header
-CAN_NAME_ALIASES = {
-    "The Bamb":        "Bamb",
-    "3:30 Amber Ale":  "3:30",
-}
+CAN_NAME_ALIASES = CONFIG["can_name_aliases"]
 
 
 def extract_can_name(toast_name):
     """Strip pack suffix (e.g. '6-Pack', '12 Pack', '6 Pack') and normalize."""
     name = re.sub(r'\s+\d+.?[Pp]ack$', '', toast_name).strip()
+    name = name.replace('\u2019', "'")  # normalize curly apostrophe → straight (Toast locations differ)
     return CAN_NAME_ALIASES.get(name, name)
 
 
@@ -145,8 +154,64 @@ def find_product_columns(rows, header_row_idx):
     }
 
 
+def expand_sheet_if_needed(service, spreadsheet_id, tab, needed_col_count):
+    """Expand the sheet's column count if it would be exceeded. Returns the sheet's numeric ID."""
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    for sheet in meta["sheets"]:
+        if sheet["properties"]["title"] == tab:
+            numeric_id = sheet["properties"]["sheetId"]
+            current = sheet["properties"]["gridProperties"]["columnCount"]
+            if needed_col_count > current:
+                new_count = needed_col_count + 10  # add buffer
+                service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": [{"updateSheetProperties": {
+                        "properties": {"sheetId": numeric_id, "gridProperties": {"columnCount": new_count}},
+                        "fields": "gridProperties.columnCount"
+                    }}]}
+                ).execute()
+                print(f"Expanded sheet columns to {new_count}.")
+            return numeric_id
+    return None
+
+
+def copy_column_formatting(service, spreadsheet_id, numeric_sheet_id, source_col_idx, dest_col_indices, row_count=60):
+    """Copy formatting from the reference column (col B) to each new column."""
+    requests = [
+        {
+            "copyPaste": {
+                "source": {
+                    "sheetId": numeric_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": row_count,
+                    "startColumnIndex": source_col_idx,
+                    "endColumnIndex": source_col_idx + 1,
+                },
+                "destination": {
+                    "sheetId": numeric_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": row_count,
+                    "startColumnIndex": dest_col,
+                    "endColumnIndex": dest_col + 1,
+                },
+                "pasteType": "PASTE_FORMAT",
+                "pasteOrientation": "NORMAL",
+            }
+        }
+        for dest_col in dest_col_indices
+    ]
+    if requests:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests}
+        ).execute()
+
+
 def add_new_columns(service, sheet_id, tab, header_row_idx, existing_cols, new_names):
-    """Append new column headers to the product header row and return the updated col dict."""
+    """Append new column headers to the product header row and return the updated col dict.
+
+    Formatting is copied from column B (the reference column) so new columns are uniform.
+    """
     if not new_names:
         return existing_cols
     next_col = max(existing_cols.values()) + 1
@@ -155,6 +220,14 @@ def add_new_columns(service, sheet_id, tab, header_row_idx, existing_cols, new_n
         updated_cols[name] = next_col
         next_col += 1
     start_col = max(existing_cols.values()) + 1
+    new_col_indices = list(range(start_col, start_col + len(new_names)))
+    numeric_sheet_id = expand_sheet_if_needed(service, sheet_id, tab, start_col + len(new_names))
+
+    # Copy formatting from column B to all new columns before writing headers
+    if numeric_sheet_id is not None:
+        copy_column_formatting(service, sheet_id, numeric_sheet_id,
+                               source_col_idx=1, dest_col_indices=new_col_indices)
+
     range_notation = f"'{tab}'!{col_letter(start_col)}{header_row_idx + 1}:{col_letter(start_col + len(new_names) - 1)}{header_row_idx + 1}"
     service.spreadsheets().values().update(
         spreadsheetId=sheet_id,
@@ -162,7 +235,7 @@ def add_new_columns(service, sheet_id, tab, header_row_idx, existing_cols, new_n
         valueInputOption="RAW",
         body={"values": [new_names]}
     ).execute()
-    print(f"Added new column(s): {', '.join(new_names)}")
+    print(f"Added new column(s): {', '.join(new_names)} (formatting copied from col B)")
     return updated_cols
 
 

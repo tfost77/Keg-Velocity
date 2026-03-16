@@ -40,18 +40,25 @@ SCOPES = [
 
 load_dotenv(BASE_DIR / ".env")
 
+
+def load_config():
+    config_path = BASE_DIR / "config.json"
+    if not config_path.exists():
+        print("ERROR: config.json not found. Copy config.example.json to config.json and customize it.")
+        sys.exit(1)
+    with open(config_path) as f:
+        return json.load(f)
+
+CONFIG = load_config()
+
 # Maps extracted Toast beer name → sheet column header
-BEER_NAME_ALIASES = {
-    "The Bamb": "Bamb",
-    "Cascara Saison": "Cascara",
-    "3:30 Amber": "3:30 Amber Ale",
-}
+BEER_NAME_ALIASES = CONFIG["beer_name_aliases"]
 
 # Sheet section header for each location
-LOCATION_SECTION_HEADERS = {
-    "Locust Point": "DBC Locust Point",
-    "Timonium":     "DBC Timonium",
-}
+LOCATION_SECTION_HEADERS = CONFIG["location_section_headers"]
+
+# Header text for the master Total Volume section (used for column alignment)
+MASTER_SECTION_HEADER = CONFIG.get("master_section_header")
 
 # Serve-type weights
 SERVE_WEIGHTS = {
@@ -59,7 +66,7 @@ SERVE_WEIGHTS = {
     "Mug":       1.2,
     "Half Pour": 0.5,
     "To-Go":     0.0,   # excluded; goes to Cans Inventory via sync_cans_to_sheets.py
-    "Other":     1.0,
+    "Other":     0.0,   # excluded; uncategorized items not tracked in inventory
 }
 
 
@@ -70,6 +77,7 @@ def slugify(name):
 def extract_beer_name(toast_name):
     """Strip number prefix (e.g. '2 -', '2M Gold -', '2H -') and normalize."""
     name = re.sub(r'^\d+[MHmh]?\s*(Gold|Silver)?\s*-\s*', '', toast_name).strip()
+    name = name.replace('\u2019', "'")  # normalize curly apostrophe → straight (Toast locations differ)
     return BEER_NAME_ALIASES.get(name, name)
 
 
@@ -110,6 +118,9 @@ def find_current_tab(service, sheet_id):
     """Find the Total Inventory tab for the current month."""
     meta = service.spreadsheets().get(spreadsheetId=sheet_id).execute()
     all_titles = [s["properties"]["title"] for s in meta["sheets"]]
+
+    if "Total Inventory" in all_titles:
+        return "Total Inventory"
 
     today = datetime.now()
     for delta in [0, -1]:
@@ -153,8 +164,159 @@ def find_beer_columns(rows, beer_row_idx):
     }
 
 
-def add_new_columns(service, sheet_id, tab, header_row_idx, existing_cols, new_names):
-    """Append new column headers to the product header row and return the updated col dict."""
+def expand_sheet_if_needed(service, spreadsheet_id, tab, needed_col_count):
+    """Expand the sheet's column count if it would be exceeded. Returns the sheet's numeric ID."""
+    meta = service.spreadsheets().get(spreadsheetId=spreadsheet_id).execute()
+    for sheet in meta["sheets"]:
+        if sheet["properties"]["title"] == tab:
+            numeric_id = sheet["properties"]["sheetId"]
+            current = sheet["properties"]["gridProperties"]["columnCount"]
+            if needed_col_count > current:
+                new_count = needed_col_count + 10  # add buffer
+                service.spreadsheets().batchUpdate(
+                    spreadsheetId=spreadsheet_id,
+                    body={"requests": [{"updateSheetProperties": {
+                        "properties": {"sheetId": numeric_id, "gridProperties": {"columnCount": new_count}},
+                        "fields": "gridProperties.columnCount"
+                    }}]}
+                ).execute()
+                print(f"Expanded sheet columns to {new_count}.")
+            return numeric_id
+    return None
+
+
+def copy_column_formatting(service, spreadsheet_id, numeric_sheet_id, source_col_idx, dest_col_indices, row_count=60):
+    """Copy formatting from the Total Volume reference column to each new column.
+
+    Uses PASTE_FORMAT so only formatting is copied — no values or formulas are touched.
+    Column B (index 1) in Total Volume is the canonical format reference.
+    """
+    requests = [
+        {
+            "copyPaste": {
+                "source": {
+                    "sheetId": numeric_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": row_count,
+                    "startColumnIndex": source_col_idx,
+                    "endColumnIndex": source_col_idx + 1,
+                },
+                "destination": {
+                    "sheetId": numeric_sheet_id,
+                    "startRowIndex": 0,
+                    "endRowIndex": row_count,
+                    "startColumnIndex": dest_col,
+                    "endColumnIndex": dest_col + 1,
+                },
+                "pasteType": "PASTE_FORMAT",
+                "pasteOrientation": "NORMAL",
+            }
+        }
+        for dest_col in dest_col_indices
+    ]
+    if requests:
+        service.spreadsheets().batchUpdate(
+            spreadsheetId=spreadsheet_id,
+            body={"requests": requests}
+        ).execute()
+
+
+def find_all_beer_header_rows(rows):
+    """Return beer-header row indices for all sections (master + each location).
+
+    Each section's beer header row is always section_start + 2 (the 'Beer:' row).
+    Sections not found in the current sheet are silently skipped.
+    """
+    all_section_texts = []
+    if MASTER_SECTION_HEADER:
+        all_section_texts.append(MASTER_SECTION_HEADER)
+    all_section_texts.extend(LOCATION_SECTION_HEADERS.values())
+
+    header_rows = []
+    for header_text in all_section_texts:
+        section_start = find_section_start(rows, header_text)
+        if section_start is not None:
+            header_rows.append(section_start + 2)
+    return header_rows
+
+
+def copy_master_formula_rows(service, spreadsheet_id, numeric_sheet_id, tab, new_col_indices):
+    """Copy all formula rows in the master (Total Volume) section to new columns.
+
+    Reads col B formulas for the master section and copies any cell whose value starts
+    with '=' to the new columns using PASTE_FORMULA (so relative references adjust
+    automatically). This covers Keg Volume, # of Pours Total, all Sales Week aggregates,
+    Avg Weekly/Daily Sales, # of Days Remaining, and Projected Kick Date.
+
+    NOTE: '# of Pours per Keg' is a plain value (not a formula) and is intentionally
+    skipped — keg size varies per beer and must be filled in by hand.
+    """
+    if not MASTER_SECTION_HEADER:
+        return
+
+    # Read col A+B with FORMULA rendering to detect which rows have formula cells
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{tab}'!A1:B60",
+        valueRenderOption="FORMULA"
+    ).execute()
+    formula_rows = result.get("values", [])
+
+    master_start = next(
+        (i for i, r in enumerate(formula_rows) if r and r[0] == MASTER_SECTION_HEADER),
+        None
+    )
+    if master_start is None:
+        return
+
+    # Collect rows in the section (up to 20 rows) where col B is a formula
+    formula_row_indices = [
+        i for i in range(master_start, min(master_start + 20, len(formula_rows)))
+        if len(formula_rows[i]) > 1 and isinstance(formula_rows[i][1], str)
+        and formula_rows[i][1].startswith("=")
+    ]
+    if not formula_row_indices:
+        return
+
+    requests = [
+        {
+            "copyPaste": {
+                "source": {
+                    "sheetId": numeric_sheet_id,
+                    "startRowIndex": row_idx,
+                    "endRowIndex": row_idx + 1,
+                    "startColumnIndex": 1,  # col B as template
+                    "endColumnIndex": 2,
+                },
+                "destination": {
+                    "sheetId": numeric_sheet_id,
+                    "startRowIndex": row_idx,
+                    "endRowIndex": row_idx + 1,
+                    "startColumnIndex": dest_col,
+                    "endColumnIndex": dest_col + 1,
+                },
+                "pasteType": "PASTE_FORMULA",
+                "pasteOrientation": "NORMAL",
+            }
+        }
+        for row_idx in formula_row_indices
+        for dest_col in new_col_indices
+    ]
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests}
+    ).execute()
+    print(f"Copied master section formulas for {len(formula_row_indices)} row(s) to {len(new_col_indices)} new column(s)")
+
+
+def add_new_columns(service, sheet_id, tab, header_row_idx, existing_cols, new_names, all_header_row_indices=None):
+    """Append new column headers to ALL section header rows and return the updated col dict.
+
+    Writing to every section (master + all locations) at the same column indices keeps the
+    sheet aligned so that beer columns line up vertically across all sections.
+    Formatting is copied from column B (Total Volume reference) so new columns are uniform.
+    All formula rows in the master section are extended automatically to the new columns.
+    """
     if not new_names:
         return existing_cols
     next_col = max(existing_cols.values()) + 1
@@ -163,14 +325,34 @@ def add_new_columns(service, sheet_id, tab, header_row_idx, existing_cols, new_n
         updated_cols[name] = next_col
         next_col += 1
     start_col = max(existing_cols.values()) + 1
-    range_notation = f"'{tab}'!{col_letter(start_col)}{header_row_idx + 1}:{col_letter(start_col + len(new_names) - 1)}{header_row_idx + 1}"
-    service.spreadsheets().values().update(
+    new_col_indices = list(range(start_col, start_col + len(new_names)))
+    numeric_sheet_id = expand_sheet_if_needed(service, sheet_id, tab, start_col + len(new_names))
+
+    # Copy formatting from column B (Total Volume reference) to all new columns first,
+    # so borders, background colors, and alignment are uniform before writing headers.
+    if numeric_sheet_id is not None:
+        copy_column_formatting(service, sheet_id, numeric_sheet_id,
+                               source_col_idx=1, dest_col_indices=new_col_indices)
+
+    # Write header to every section so all stay aligned; fall back to current section only.
+    target_rows = all_header_row_indices if all_header_row_indices else [header_row_idx]
+    updates = []
+    for hrow_idx in target_rows:
+        if hrow_idx is not None:
+            r = f"'{tab}'!{col_letter(start_col)}{hrow_idx + 1}:{col_letter(start_col + len(new_names) - 1)}{hrow_idx + 1}"
+            updates.append({"range": r, "values": [new_names]})
+    service.spreadsheets().values().batchUpdate(
         spreadsheetId=sheet_id,
-        range=range_notation,
-        valueInputOption="RAW",
-        body={"values": [new_names]}
+        body={"valueInputOption": "RAW", "data": updates}
     ).execute()
-    print(f"Added new column(s): {', '.join(new_names)}")
+
+    # Extend all master-section formula rows to new columns (Keg Volume, # of Pours Total,
+    # Sales Week aggregates, Avg Weekly/Daily Sales, # of Days Remaining, Projected Kick Date).
+    # Uses PASTE_FORMULA from col B so relative references adjust automatically.
+    if numeric_sheet_id is not None:
+        copy_master_formula_rows(service, sheet_id, numeric_sheet_id, tab, new_col_indices)
+
+    print(f"Added new column(s): {', '.join(new_names)} (synced across {len(target_rows)} section(s), formatting copied from col B)")
     return updated_cols
 
 
@@ -261,6 +443,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--location", required=True, help='Location name, e.g. "Locust Point"')
     parser.add_argument("--overwrite", action="store_true", help="Overwrite the last filled Sales Week row instead of appending")
+    parser.add_argument("--week", help='Target a specific week label, e.g. "Sales Week 4"')
     args = parser.parse_args()
 
     sheet_id = os.getenv("GOOGLE_SHEET_ID")
@@ -305,7 +488,17 @@ def main():
         sys.exit(1)
 
     col_indices = list(beer_cols.values())
-    if args.overwrite:
+    if args.week:
+        target_row_idx = next(
+            (i for i in range(section_start, min(section_start + 20, len(rows)))
+             if rows[i] and rows[i][0] == args.week),
+            None
+        )
+        if target_row_idx is None:
+            print(f"ERROR: '{args.week}' not found in section '{args.location}'")
+            sys.exit(1)
+        mode = "Overwriting"
+    elif args.overwrite:
         target_row_idx = find_last_filled_week_row(rows, section_start, col_indices)
         if target_row_idx is None:
             print(f"ERROR: No filled Sales Week rows found to overwrite for '{args.location}'")
@@ -327,10 +520,12 @@ def main():
     week_label = rows[target_row_idx][0] if target_row_idx < len(rows) and rows[target_row_idx] else "?"
     print(f"{mode}: {week_label} (sheet row {target_row_idx + 1})")
 
-    # Add columns for any beers in Toast data not yet in the sheet
+    # Add columns for any beers in Toast data not yet in the sheet.
+    # Pass all section beer-header rows so every section stays column-aligned.
     new_beers = [b for b in beer_totals if b not in beer_cols]
     if new_beers:
-        beer_cols = add_new_columns(service, sheet_id, tab, beer_header_idx, beer_cols, new_beers)
+        all_header_rows = find_all_beer_header_rows(rows)
+        beer_cols = add_new_columns(service, sheet_id, tab, beer_header_idx, beer_cols, new_beers, all_header_rows)
 
     max_col = max(beer_cols.values()) + 1
     current_row = list(rows[target_row_idx]) if target_row_idx < len(rows) else []
@@ -339,8 +534,17 @@ def main():
     matched, no_data = [], []
     for beer_name, col_idx in beer_cols.items():
         if beer_name in beer_totals:
-            new_row[col_idx] = beer_totals[beer_name]
+            new_row[col_idx] = int(beer_totals[beer_name])
             matched.append(f"{beer_name}: {beer_totals[beer_name]}")
+        elif col_idx < len(current_row) and isinstance(current_row[col_idx], str):
+            # current_row values come back from the API as strings; keep them as numbers
+            # so RAW doesn't store them as text (which breaks AVERAGEIF formulas)
+            raw = current_row[col_idx].strip()
+            try:
+                new_row[col_idx] = int(float(raw)) if raw else ""
+            except (ValueError, TypeError):
+                new_row[col_idx] = raw
+            no_data.append(beer_name)
         else:
             no_data.append(beer_name)
 

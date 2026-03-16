@@ -12,6 +12,7 @@ Output: .tmp/{location_slug}_parsed_items.json
 import argparse
 import csv
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -22,17 +23,17 @@ TMP_DIR = BASE_DIR / ".tmp"
 def slugify(name):
     return name.lower().replace(" ", "_")
 
-EXCLUDED_ITEMS = {
-    "Soppressata", "Genovese", "Sparkling Water", "Mexican Coke",
-    "Chicken Tenders", "Formaggio", "Margherita", "Arizona Teas",
-    "Vegan Pie", "Juice Boxes", "Sauce Cake", "Inky Stickers",
-    "Best Day Brewing Non-Alcoholic Can", "Chicken Tendies", "Jersey",
-    "Underberg", "Diet Coke Bottle", "Sanpellegrino Sparkling",
-    "Pizza & Beer Shirt XXL", "Whiskey Pretzels", "Cider Can",
-    "Gatorade Can", "Event Fee", "Green Shirt L", "Topo Chico",
-    "Athletic Brewing Non-Alcoholic Beer", "Ranch Side", "Mustard",
-    "Houston Writers", "Shield Sticker", "Test", "Tip", "Dave Buy",
-}
+
+def load_config():
+    config_path = BASE_DIR / "config.json"
+    if not config_path.exists():
+        print("ERROR: config.json not found. Copy config.example.json to config.json and customize it.")
+        sys.exit(1)
+    with open(config_path) as f:
+        return json.load(f)
+
+CONFIG = load_config()
+EXCLUDED_ITEMS = set(CONFIG["excluded_items"])
 
 
 def find_csv(location_slug=None):
@@ -60,6 +61,19 @@ def find_csv(location_slug=None):
     return None
 
 
+def is_beer_item(name):
+    """Only include items that match Toast's beer naming conventions.
+    Draft beer starts with a tap number (e.g. '2 - Green Machine', '2H - ...', '2M Gold - ...').
+    Packaged beer ends with a pack size (e.g. 'Green Machine 6-Pack', 'Lager 12 Pack').
+    Everything else (food, merch, event fees, pitchers, etc.) is excluded.
+    """
+    if re.match(r'^\d+', name):
+        return True
+    if re.search(r'\d+.?[Pp]ack', name):
+        return True
+    return False
+
+
 def parse(csv_path):
     items = []
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
@@ -68,8 +82,10 @@ def parse(csv_path):
             name = row.get("Item Name", "").strip()
             category = row.get("Sales Category", "").strip()
 
-            # Skip excluded items
+            # Skip excluded items and non-beer items
             if not name or name in EXCLUDED_ITEMS:
+                continue
+            if not is_beer_item(name):
                 continue
 
             # Only use summary rows (empty Sales Category = total row for that item)

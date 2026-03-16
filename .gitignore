@@ -2,6 +2,9 @@
 .env
 .env.*
 
+# User-specific config (copy config.example.json → config.json and customize)
+config.json
+
 # Google OAuth credentials
 credentials.json
 token.json

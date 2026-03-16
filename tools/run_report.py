@@ -14,17 +14,26 @@ CSV files expected in .tmp/:
 """
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
 
 TOOLS_DIR = Path(__file__).parent
+BASE_DIR = TOOLS_DIR.parent
 
-# Add or remove locations here. Key = display name, value = CSV filename in .tmp/
-LOCATIONS = {
-    "Locust Point": "locust_point.csv",
-    "Timonium":     "timonium.csv",
-}
+def load_config():
+    config_path = BASE_DIR / "config.json"
+    if not config_path.exists():
+        print("ERROR: config.json not found. Copy config.example.json to config.json and customize it.")
+        sys.exit(1)
+    with open(config_path) as f:
+        return json.load(f)
+
+CONFIG = load_config()
+
+# Add or remove locations in config.json. Key = display name, value = CSV filename in .tmp/
+LOCATIONS = CONFIG["locations"]
 
 STEPS = [
     "parse_toast_csv.py",
@@ -100,6 +109,18 @@ def main():
     # Combined cans sync runs once after all locations are processed
     print("[Cans Inventory]")
     run_cans_sync(overwrite=args.overwrite)
+    print()
+
+    # Re-apply formatting and formulas so new columns are always correct
+    print("[Formatting]")
+    print("  → Right-aligning data rows...")
+    result = subprocess.run([sys.executable, str(TOOLS_DIR / "right_align_data_rows.py"), "--write"])
+    if result.returncode != 0:
+        print("  WARNING: right_align_data_rows.py failed — formatting may need manual correction.")
+    print("  → Filling missing Cans Inventory formulas...")
+    result = subprocess.run([sys.executable, str(TOOLS_DIR / "apply_cans_formulas.py"), "--write"])
+    if result.returncode != 0:
+        print("  WARNING: apply_cans_formulas.py failed — formulas may need manual correction.")
     print()
 
     print("✓ Done.")

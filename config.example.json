@@ -1,0 +1,20 @@
+{
+  "locations": {
+    "Location Name": "location_name.csv"
+  },
+  "excluded_items": [
+    "Non-beer item 1",
+    "Non-beer item 2"
+  ],
+  "beer_name_aliases": {
+    "Toast Name That Differs": "Sheet Column Header"
+  },
+  "master_section_header": "Sheet Section Header for the Master Total Volume Section",
+  "location_section_headers": {
+    "Location Name": "Sheet Section Header for That Location"
+  },
+  "cans_section_header": "Section header in the Cans Inventory tab",
+  "can_name_aliases": {
+    "Toast Can Name That Differs": "Sheet Column Header"
+  }
+}
