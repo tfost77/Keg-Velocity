@@ -60,6 +60,41 @@ Use `--overwrite` to replace the last filled week in the sheet instead of append
 python3 tools/run_report.py --overwrite
 ```
 
+## Deploying to Streamlit Cloud (shared dashboard)
+
+Streamlit Cloud lets your team access the report tool from a URL — no local setup needed.
+
+### 1. Set up a Google service account
+
+Service accounts authenticate headlessly (no browser popup), which is required for hosted deployments.
+
+1. Go to [Google Cloud Console](https://console.cloud.google.com) → **IAM & Admin → Service Accounts**
+2. Create a service account, then create a JSON key for it
+3. Open your Google Sheet → **Share** → add the service account's email address as an **Editor**
+
+### 2. Deploy on Streamlit Cloud
+
+1. Go to [share.streamlit.io](https://share.streamlit.io) and connect your GitHub repo
+2. Set **Main file path** to `app.py`
+3. Under **Settings → Secrets**, add the following:
+
+```toml
+GOOGLE_SHEET_ID = "your-sheet-id"
+GOOGLE_SERVICE_ACCOUNT_JSON = '{"type": "service_account", ...}'  # full key JSON, single line
+INVENTORY_CONFIG = '{"locations": {...}, ...}'  # full config.json contents, single line
+```
+
+> **Tip:** To get `GOOGLE_SERVICE_ACCOUNT_JSON` as a single line, run:
+> `python3 -c "import json; print(json.dumps(json.load(open('your-key.json'))))"`
+>
+> Same for `INVENTORY_CONFIG` from your `config.json`.
+
+### 3. Use it
+
+Navigate to your Streamlit URL, upload the CSVs for each location, and click **Run Report**. Data syncs directly to Google Sheets.
+
+---
+
 ## How to export from Toast
 
 1. Log in to Toast Back Office (pos.toasttab.com)

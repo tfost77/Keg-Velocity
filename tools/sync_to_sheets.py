@@ -25,29 +25,16 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from auth import get_sheets_service
+from config_loader import load_config
+
 from dotenv import load_dotenv
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 
 BASE_DIR = Path(__file__).parent.parent
 TMP_DIR = BASE_DIR / ".tmp"
-SCOPES = [
-    "https://www.googleapis.com/auth/gmail.send",
-    "https://www.googleapis.com/auth/spreadsheets",
-]
 
 load_dotenv(BASE_DIR / ".env")
-
-
-def load_config():
-    config_path = BASE_DIR / "config.json"
-    if not config_path.exists():
-        print("ERROR: config.json not found. Copy config.example.json to config.json and customize it.")
-        sys.exit(1)
-    with open(config_path) as f:
-        return json.load(f)
 
 CONFIG = load_config()
 
@@ -90,28 +77,6 @@ def col_letter(n):
         result = chr(r + ord('A')) + result
     return result
 
-
-def get_sheets_service():
-    creds = None
-    token_path = BASE_DIR / "token.json"
-    creds_path = BASE_DIR / "credentials.json"
-
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            if not creds_path.exists():
-                print("ERROR: credentials.json not found")
-                sys.exit(1)
-            flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w") as f:
-            f.write(creds.to_json())
-
-    return build("sheets", "v4", credentials=creds)
 
 
 def find_current_tab(service, sheet_id):
@@ -356,6 +321,61 @@ def add_new_columns(service, sheet_id, tab, header_row_idx, existing_cols, new_n
     return updated_cols
 
 
+def copy_location_formula_row(service, spreadsheet_id, numeric_sheet_id, tab, rows, section_start, row_label, new_col_indices):
+    """Find a labeled row within a section and copy its col-B formula to new columns.
+
+    Used to propagate rows like 'Total Keg Volume' in the Timonium section that contain
+    formulas referencing hand-entered sub-rows (e.g. 'In Timonium', 'In LP Cold Box').
+    Skips silently if the row is not found or has no formula in col B.
+    """
+    formula_row_idx = None
+    for i in range(section_start, min(section_start + 25, len(rows))):
+        if rows[i] and rows[i][0] == row_label:
+            formula_row_idx = i
+            break
+    if formula_row_idx is None:
+        return
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=spreadsheet_id,
+        range=f"'{tab}'!B{formula_row_idx + 1}",
+        valueRenderOption="FORMULA"
+    ).execute()
+    values = result.get("values", [[]])
+    cell_val = values[0][0] if values and values[0] else ""
+    if not (isinstance(cell_val, str) and cell_val.startswith("=")):
+        return  # not a formula — skip
+
+    requests = [
+        {
+            "copyPaste": {
+                "source": {
+                    "sheetId": numeric_sheet_id,
+                    "startRowIndex": formula_row_idx,
+                    "endRowIndex": formula_row_idx + 1,
+                    "startColumnIndex": 1,
+                    "endColumnIndex": 2,
+                },
+                "destination": {
+                    "sheetId": numeric_sheet_id,
+                    "startRowIndex": formula_row_idx,
+                    "endRowIndex": formula_row_idx + 1,
+                    "startColumnIndex": dest_col,
+                    "endColumnIndex": dest_col + 1,
+                },
+                "pasteType": "PASTE_FORMULA",
+                "pasteOrientation": "NORMAL",
+            }
+        }
+        for dest_col in new_col_indices
+    ]
+    service.spreadsheets().batchUpdate(
+        spreadsheetId=spreadsheet_id,
+        body={"requests": requests}
+    ).execute()
+    print(f"Copied '{row_label}' formula to {len(new_col_indices)} new column(s)")
+
+
 def find_all_week_rows(rows, section_start):
     week_rows = []
     for i in range(section_start, min(section_start + 20, len(rows))):
@@ -524,8 +544,17 @@ def main():
     # Pass all section beer-header rows so every section stays column-aligned.
     new_beers = [b for b in beer_totals if b not in beer_cols]
     if new_beers:
+        new_col_start = max(beer_cols.values()) + 1  # capture before beer_cols is updated
         all_header_rows = find_all_beer_header_rows(rows)
         beer_cols = add_new_columns(service, sheet_id, tab, beer_header_idx, beer_cols, new_beers, all_header_rows)
+        # For Timonium, also propagate the "Total Keg Volume" formula row (which sums
+        # hand-entered sub-rows "In Timonium" and "In LP Cold Box") to new columns.
+        if args.location == "Timonium":
+            new_col_indices = list(range(new_col_start, new_col_start + len(new_beers)))
+            numeric_sheet_id = expand_sheet_if_needed(service, sheet_id, tab, max(beer_cols.values()) + 1)
+            if numeric_sheet_id is not None:
+                copy_location_formula_row(service, sheet_id, numeric_sheet_id, tab, rows,
+                                          section_start, "Total Keg Volume", new_col_indices)
 
     max_col = max(beer_cols.values()) + 1
     current_row = list(rows[target_row_idx]) if target_row_idx < len(rows) else []

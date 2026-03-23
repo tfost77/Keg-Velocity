@@ -14,7 +14,6 @@ CSV files expected in .tmp/:
 """
 
 import argparse
-import json
 import subprocess
 import sys
 from pathlib import Path
@@ -22,13 +21,8 @@ from pathlib import Path
 TOOLS_DIR = Path(__file__).parent
 BASE_DIR = TOOLS_DIR.parent
 
-def load_config():
-    config_path = BASE_DIR / "config.json"
-    if not config_path.exists():
-        print("ERROR: config.json not found. Copy config.example.json to config.json and customize it.")
-        sys.exit(1)
-    with open(config_path) as f:
-        return json.load(f)
+sys.path.insert(0, str(TOOLS_DIR))
+from config_loader import load_config
 
 CONFIG = load_config()
 
@@ -38,17 +32,13 @@ LOCATIONS = CONFIG["locations"]
 STEPS = [
     "parse_toast_csv.py",
     "calculate_velocity.py",
-    "build_report.py",
     "sync_to_sheets.py",
-    "send_email.py",
 ]
 
 STEP_LABELS = {
     "parse_toast_csv.py":    "Parsing Toast CSV",
     "calculate_velocity.py": "Calculating velocity",
-    "build_report.py":       "Building report",
     "sync_to_sheets.py":     "Syncing to Google Sheets (draft beer)",
-    "send_email.py":         "Sending email",
 }
 
 

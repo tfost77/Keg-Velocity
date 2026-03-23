@@ -24,25 +24,14 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from auth import get_sheets_service
+from config_loader import load_config
+
 from dotenv import load_dotenv
-from google.auth.transport.requests import Request
-from google.oauth2.credentials import Credentials
-from google_auth_oauthlib.flow import InstalledAppFlow
-from googleapiclient.discovery import build
 
 BASE_DIR = Path(__file__).parent.parent
-SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 load_dotenv(BASE_DIR / ".env")
-
-
-def load_config():
-    config_path = BASE_DIR / "config.json"
-    if not config_path.exists():
-        print("ERROR: config.json not found.")
-        sys.exit(1)
-    with open(config_path) as f:
-        return json.load(f)
-
 
 CONFIG = load_config()
 CANS_SECTION_HEADER = CONFIG["cans_section_header"]
@@ -56,22 +45,6 @@ def col_letter(n):
         result = chr(r + ord("A")) + result
     return result
 
-
-def get_sheets_service():
-    creds = None
-    token_path = BASE_DIR / "token.json"
-    creds_path = BASE_DIR / "credentials.json"
-    if token_path.exists():
-        creds = Credentials.from_authorized_user_file(str(token_path), SCOPES)
-    if not creds or not creds.valid:
-        if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
-        else:
-            flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), SCOPES)
-            creds = flow.run_local_server(port=0)
-        with open(token_path, "w") as f:
-            f.write(creds.to_json())
-    return build("sheets", "v4", credentials=creds)
 
 
 def find_cans_tab(service, sheet_id):
