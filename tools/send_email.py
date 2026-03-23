@@ -65,15 +65,16 @@ def get_gmail_service():
 
 
 def send_email(service, sender, recipient, subject, html_body):
+    recipients = [r.strip() for r in recipient.split(",") if r.strip()]
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = sender
-    msg["To"] = recipient
+    msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(html_body, "html"))
 
     raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
     service.users().messages().send(userId="me", body={"raw": raw}).execute()
-    print(f"Email sent → {recipient}")
+    print(f"Email sent → {', '.join(recipients)}")
 
 
 def main():

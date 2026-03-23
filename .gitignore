@@ -1,6 +1,7 @@
 # Environment variables & secrets
 .env
 .env.*
+!.env.example
 
 # User-specific config (copy config.example.json → config.json and customize)
 config.json

@@ -1,7 +1,7 @@
 # Weekly Sales Velocity Report
 
 ## Objective
-Generate a weekly sales velocity report from a manually exported Toast POS CSV and email it to tom@diamondbackbeer.com.
+Generate a weekly sales velocity report from a manually exported Toast POS CSV and email it to all recipients defined in `GMAIL_RECIPIENT` (`.env`).
 
 ## Trigger
 - **Manual**: Drop both location CSVs into `.tmp/`, then run:
